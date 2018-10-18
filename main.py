@@ -39,7 +39,7 @@ parser.add_argument('--seed', type=int, default=1111,
                     help='random seed')
 parser.add_argument('--cuda', action='store_true',
                     help='use CUDA')
-parser.add_argument('--log-interval', type=int, default=200, metavar='N',
+parser.add_argument('--log-interval', type=int, default=20, metavar='N',
                     help='report interval')
 parser.add_argument('--save', type=str, default='model.pt',
                     help='path to save the final model')
@@ -60,7 +60,8 @@ device = torch.device("cuda" if args.cuda else "cpu")
 ###############################################################################
 
 corpus = data.Corpus(args.data)
-
+# print(corpus.tagmap)
+# print(corpus.test, corpus.test[0].size())
 # Starting from sequential data, batchify arranges the dataset into columns.
 # For instance, with the alphabet as the sequence and batch size 4, we'd get
 # ┌ a g m s ┐
@@ -74,26 +75,35 @@ corpus = data.Corpus(args.data)
 # batch processing.
 
 def batchify(data, bsz):
-    # Work out how cleanly we can divide the dataset into bsz parts.
-    nbatch = data.size(0) // bsz
+    tokens, tags = data
+    #print(tokens, tags)
+   # Work out how cleanly we can divide the dataset into bsz parts.
+    nbatch = tokens.size(0) // bsz
     # Trim off any extra elements that wouldn't cleanly fit (remainders).
-    data = data.narrow(0, 0, nbatch * bsz)
+    tokens = tokens.narrow(0, 0, nbatch * bsz)
+    tags = tags.narrow(0, 0, nbatch * bsz)
+    
     # Evenly divide the data across the bsz batches.
-    data = data.view(bsz, -1).t().contiguous()
-    return data.to(device)
+    tokens = tokens.view(bsz, -1).t().contiguous()
+    tags = tags.view(bsz, -1).t().contiguous()
+    #print(tokens, tags)
+    return tokens.to(device), tags.to(device)
 
+   
 eval_batch_size = 10
 train_data = batchify(corpus.train, args.batch_size)
 val_data = batchify(corpus.valid, eval_batch_size)
 test_data = batchify(corpus.test, eval_batch_size)
+
 
 ###############################################################################
 # Build the model
 ###############################################################################
 
 ntokens = len(corpus.dictionary)
-nchar_tokens = len(corpus.charmap)
-model = model.RNNModel(args.model, ntokens, args.emsize, args.nhid, args.nlayers, corpus, args.dropout, args.tied).to(device)
+nclasses = len(corpus.tagmap)
+print(corpus.tagmap)
+model = model.RNNModel(args.model, ntokens, nclasses, args.emsize, args.nhid, args.nlayers, corpus, args.dropout, args.tied).to(device)
 
 criterion = nn.CrossEntropyLoss()
 
@@ -120,9 +130,12 @@ def repackage_hidden(h):
 # to the seq_len dimension in the LSTM.
 
 def get_batch(source, i):
-    seq_len = min(args.bptt, len(source) - 1 - i)
-    data = source[i:i+seq_len]
-    target = source[i+1:i+1+seq_len].view(-1)
+    tokens, tags = source
+    seq_len = min(args.bptt, len(tokens) - 1 - i)
+    #seq_len = tokens.size()[0]
+    data = tokens[i:i+seq_len]
+    target = tags[i:i+seq_len].view(-1)
+    #print(data, target)
     return data, target
 
 
@@ -133,13 +146,13 @@ def evaluate(data_source):
     ntokens = len(corpus.dictionary)
     hidden = model.init_hidden(eval_batch_size)
     with torch.no_grad():
-        for i in range(0, data_source.size(0) - 1, args.bptt):
+        for i in range(0, data_source[0].size()[0] - 1, args.bptt):
             data, targets = get_batch(data_source, i)
             output, hidden = model(data, hidden)
-            output_flat = output.view(-1, ntokens)
+            output_flat = output.view(-1, nclasses)
             total_loss += len(data) * criterion(output_flat, targets).item()
             hidden = repackage_hidden(hidden)
-    return total_loss / len(data_source)
+    return total_loss / data_source[0].size()[0]
 
 
 def train():
@@ -149,15 +162,16 @@ def train():
     start_time = time.time()
     ntokens = len(corpus.dictionary)
     hidden = model.init_hidden(args.batch_size)
-    for batch, i in enumerate(range(0, train_data.size(0) - 1, args.bptt)):
-        data, targets = get_batch(train_data, i)
-        #print(data, targets)
+    train_data_size = train_data[0].size()[0]
+        
+    for batch, i in enumerate(range(0, train_data_size - 1, args.bptt)):
+        data, targets = get_batch(train_data, i)        
         # Starting each batch, we detach the hidden state from how it was previously produced.
         # If we didn't, the model would try backpropagating all the way to start of the dataset.
         hidden = repackage_hidden(hidden)
         model.zero_grad()
         output, hidden = model(data, hidden)
-        loss = criterion(output.view(-1, ntokens), targets)
+        loss = criterion(output.view(-1, nclasses), targets)
         loss.backward()
 
         # `clip_grad_norm` helps prevent the exploding gradient problem in RNNs / LSTMs.
@@ -173,13 +187,13 @@ def train():
             #    print(p)
 
         total_loss += loss.item()
-
+        
         if batch % args.log_interval == 0 and batch > 0:
             cur_loss = total_loss / args.log_interval
             elapsed = time.time() - start_time
             print('| epoch {:3d} | {:5d}/{:5d} batches | lr {:02.2f} | ms/batch {:5.2f} | '
                     'loss {:5.2f} | ppl {:8.2f}'.format(
-                epoch, batch, len(train_data) // args.bptt, lr,
+                epoch, batch, train_data_size // args.bptt, lr,
                 elapsed * 1000 / args.log_interval, cur_loss, math.exp(cur_loss)))
             total_loss = 0
             start_time = time.time()
